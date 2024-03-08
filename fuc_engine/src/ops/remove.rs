@@ -53,6 +53,10 @@ impl<'a, I: Into<Cow<'a, Path>>, F: IntoIterator<Item = I>> RemoveOp<'a, I, F> {
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(level = "trace", skip(files, remove))
+)]
 fn schedule_deletions<'a, I: Into<Cow<'a, Path>>, F: IntoIterator<Item = I>>(
     RemoveOp {
         files,
@@ -111,8 +115,21 @@ fn schedule_deletions<'a, I: Into<Cow<'a, Path>>, F: IntoIterator<Item = I>>(
 #[cfg(target_os = "linux")]
 mod compat {
     use std::{
-        borrow::Cow, cell::LazyCell, ffi::CString, mem::MaybeUninit, num::NonZeroUsize, path::Path,
-        sync::Arc, thread, thread::JoinHandle,
+        borrow::Cow,
+        cell::LazyCell,
+        env::{current_dir, set_current_dir},
+        ffi::{CStr, CString, OsStr},
+        fs,
+        mem::MaybeUninit,
+        num::NonZeroUsize,
+        os::{
+            fd::{AsFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+        thread::JoinHandle,
     };
 
     use crossbeam_channel::{Receiver, Sender};
@@ -129,9 +146,9 @@ mod compat {
         Error,
     };
 
-    struct Impl<LF: FnOnce() -> (Sender<Message>, JoinHandle<Result<(), Error>>)> {
+    struct Impl<LF: FnOnce() -> (Sender<TreeNode>, JoinHandle<Result<(), Error>>)> {
         #[allow(clippy::type_complexity)]
-        scheduling: LazyCell<(Sender<Message>, JoinHandle<Result<(), Error>>), LF>,
+        scheduling: LazyCell<(Sender<TreeNode>, JoinHandle<Result<(), Error>>), LF>,
     }
 
     pub fn remove_impl<'a>() -> impl DirectoryOp<Cow<'a, Path>> {
@@ -143,22 +160,24 @@ mod compat {
         Impl { scheduling }
     }
 
-    impl<LF: FnOnce() -> (Sender<Message>, JoinHandle<Result<(), Error>>)>
+    impl<LF: FnOnce() -> (Sender<TreeNode>, JoinHandle<Result<(), Error>>)>
         DirectoryOp<Cow<'_, Path>> for Impl<LF>
     {
+        #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
         fn run(&self, dir: Cow<Path>) -> Result<(), Error> {
             let Self { ref scheduling } = *self;
 
             let (tasks, _) = &**scheduling;
             tasks
-                .send(Message::Node(TreeNode {
+                .send(TreeNode {
                     path: path_buf_to_cstring(dir.into_owned())?,
-                    _parent: None,
+                    parent: None,
                     messages: tasks.clone(),
-                }))
+                })
                 .map_err(|_| Error::Internal)
         }
 
+        #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
         fn finish(self) -> Result<(), Error> {
             let Self { scheduling } = self;
 
@@ -170,7 +189,10 @@ mod compat {
         }
     }
 
-    fn root_worker_thread(tasks: Receiver<Message>) -> Result<(), Error> {
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(tasks)))]
+    fn root_worker_thread(tasks: Receiver<TreeNode>) -> Result<(), Error> {
+        unshare(UnshareFlags::FILES | UnshareFlags::FS).map_io_err(|| "Failed to unshare I/O.")?;
+
         let mut available_parallelism = thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1)
@@ -184,6 +206,13 @@ mod compat {
                 for message in &tasks {
                     let mut maybe_spawn = || {
                         if available_parallelism > 0 && !tasks.is_empty() {
+                            #[cfg(feature = "tracing")]
+                            tracing::event!(
+                                tracing::Level::TRACE,
+                                available_parallelism,
+                                "Spawning new thread."
+                            );
+
                             available_parallelism -= 1;
                             threads.push(scope.spawn({
                                 let tasks = tasks.clone();
@@ -193,10 +222,7 @@ mod compat {
                     };
                     maybe_spawn();
 
-                    match message {
-                        Message::Node(node) => delete_dir(node, &mut buf, maybe_spawn)?,
-                        Message::Error(e) => return Err(e),
-                    }
+                    process_dir(message, &mut buf, maybe_spawn)?;
                 }
             }
 
@@ -207,23 +233,25 @@ mod compat {
         })
     }
 
-    fn worker_thread(tasks: Receiver<Message>) -> Result<(), Error> {
-        unshare(UnshareFlags::FILES).map_io_err(|| "Failed to unshare FD table.".to_string())?;
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(tasks)))]
+    fn worker_thread(tasks: Receiver<TreeNode>) -> Result<(), Error> {
+        unshare(UnshareFlags::FILES | UnshareFlags::FS).map_io_err(|| "Failed to unshare I/O.")?;
 
         let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
         for message in tasks {
-            match message {
-                Message::Node(node) => delete_dir(node, &mut buf, || {})?,
-                Message::Error(e) => return Err(e),
-            }
+            process_dir(message, &mut buf, || {})?;
         }
         Ok(())
     }
 
-    fn delete_dir(
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "trace", skip(node, buf, maybe_spawn))
+    )]
+    fn process_dir(
         node: TreeNode,
         buf: &mut [MaybeUninit<u8>],
-        mut maybe_spawn: impl FnMut(),
+        maybe_spawn: impl FnMut(),
     ) -> Result<(), Error> {
         let dir = openat(
             CWD,
@@ -232,11 +260,48 @@ mod compat {
             Mode::empty(),
         )
         .map_io_err(|| format!("Failed to open directory: {:?}", node.path))?;
+        let node = delete_dir_contents(node, dir, buf, maybe_spawn)?;
+        delete_dir(node)
+    }
 
-        let node = LazyCell::new(|| Arc::new(node));
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "trace", skip(node, dir, buf, maybe_spawn))
+    )]
+    fn delete_dir_contents(
+        node: TreeNode,
+        dir: OwnedFd,
+        buf: &mut [MaybeUninit<u8>],
+        mut maybe_spawn: impl FnMut(),
+    ) -> Result<Option<TreeNode>, Error> {
+        enum Arcable<T> {
+            Raw(T),
+            Arced(Arc<T>),
+        }
+
+        impl<T> Arcable<T> {
+            fn into_inner(this: Self) -> Option<T> {
+                match this {
+                    Self::Raw(t) => Some(t),
+                    Self::Arced(arc) => Arc::into_inner(arc),
+                }
+            }
+        }
+
+        impl<T> AsRef<T> for Arcable<T> {
+            fn as_ref(&self) -> &T {
+                match self {
+                    Self::Raw(node) => node,
+                    Self::Arced(arc) => arc,
+                }
+            }
+        }
+
+        let mut node = Arcable::Raw(node);
         let mut raw_dir = RawDir::new(&dir, buf);
         while let Some(file) = raw_dir.next() {
-            let file = file.map_io_err(|| format!("Failed to read directory: {:?}", node.path))?;
+            let file =
+                file.map_io_err(|| format!("Failed to read directory: {:?}", node.as_ref().path))?;
             {
                 let name = file.file_name();
                 if name == c"." || name == c".." {
@@ -245,57 +310,110 @@ mod compat {
             }
 
             let file_type = match file.file_type() {
-                FileType::Unknown => get_file_type(&dir, file.file_name(), &node.path)?,
+                FileType::Unknown => get_file_type(&dir, file.file_name(), &node.as_ref().path)?,
                 t => t,
             };
             if file_type == FileType::Directory {
+                if node.as_ref().path.as_bytes_with_nul().len() + file.file_name().count_bytes()
+                    > 4096
+                {
+                    long_path_fallback_deletion(&node.as_ref().path, file.file_name())?;
+                    continue;
+                }
+
                 maybe_spawn();
+
+                let node = match node {
+                    Arcable::Raw(raw) => {
+                        let arc = Arc::new(raw);
+                        node = Arcable::Arced(arc.clone());
+                        arc
+                    }
+                    Arcable::Arced(ref node) => node.clone(),
+                };
                 node.messages
-                    .send(Message::Node(TreeNode {
+                    .send(TreeNode {
                         path: concat_cstrs(&node.path, file.file_name()),
-                        _parent: Some(node.clone()),
+                        parent: Some(node.clone()),
                         messages: node.messages.clone(),
-                    }))
+                    })
                     .map_err(|_| Error::Internal)?;
             } else {
-                unlinkat(&dir, file.file_name(), AtFlags::empty()).map_io_err(|| {
-                    format!(
-                        "Failed to delete file: {:?}",
-                        join_cstr_paths(&node.path, file.file_name())
-                    )
-                })?;
+                delete_file(node.as_ref(), &dir, file.file_name())?;
             }
+        }
+
+        Ok(Arcable::into_inner(node))
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(node)))]
+    fn delete_dir(mut node: Option<TreeNode>) -> Result<(), Error> {
+        let mut result = Ok(());
+        while let Some(TreeNode {
+            ref path,
+            parent,
+            messages: _,
+        }) = node
+        {
+            if result.is_ok() {
+                result = unlinkat(CWD, path, AtFlags::REMOVEDIR)
+                    .map_io_err(|| format!("Failed to delete directory: {path:?}"));
+            }
+            node = parent.and_then(Arc::into_inner);
+        }
+        result
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "trace", skip(node, dir))
+    )]
+    fn delete_file(node: &TreeNode, dir: impl AsFd, file: &CStr) -> Result<(), Error> {
+        unlinkat(&dir, file, AtFlags::empty()).map_io_err(|| {
+            format!(
+                "Failed to delete file: {:?}",
+                join_cstr_paths(&node.path, file)
+            )
+        })
+    }
+
+    #[cold]
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
+    fn long_path_fallback_deletion(parent: &CString, child: &CStr) -> Result<(), Error> {
+        struct CurrentDir(PathBuf);
+
+        impl CurrentDir {
+            fn new() -> Result<Self, Error> {
+                Ok(Self(
+                    current_dir().map_io_err(|| "Failed to get current directory")?,
+                ))
+            }
+        }
+
+        impl Drop for CurrentDir {
+            fn drop(&mut self) {
+                set_current_dir(&self.0).expect("Failed to restore current dir");
+            }
+        }
+
+        let _guard = CurrentDir::new()?;
+        {
+            let parent = Path::new(OsStr::from_bytes(parent.as_bytes()));
+            set_current_dir(parent)
+                .map_io_err(|| format!("Failed to set current directory: {parent:?}"))?;
+        }
+        {
+            let child = Path::new(OsStr::from_bytes(child.to_bytes()));
+            fs::remove_dir_all(child)
+                .map_io_err(|| format!("Failed to delete directory and its contents: {child:?}"))?;
         }
         Ok(())
     }
 
-    enum Message {
-        Node(TreeNode),
-        Error(Error),
-    }
-
     struct TreeNode {
         path: CString,
-        // Needed for the recursive drop implementation
-        _parent: Option<Arc<TreeNode>>,
-        messages: Sender<Message>,
-    }
-
-    impl Drop for TreeNode {
-        fn drop(&mut self) {
-            let Self {
-                ref path,
-                _parent: _,
-                ref messages,
-            } = *self;
-
-            if let Err(e) = unlinkat(CWD, path, AtFlags::REMOVEDIR)
-                .map_io_err(|| format!("Failed to delete directory: {path:?}"))
-            {
-                // If the receiver closed, then another error must have already occurred.
-                drop(messages.send(Message::Error(e)));
-            }
-        }
+        parent: Option<Arc<TreeNode>>,
+        messages: Sender<TreeNode>,
     }
 }
 

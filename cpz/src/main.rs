@@ -51,14 +51,49 @@ struct Cpz {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum CliError {
+enum CliError {
     #[error("{0}")]
     Wrapper(String),
 }
 
+#[cfg(feature = "trace")]
+#[global_allocator]
+static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
+    tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
+
 fn main() -> error_stack::Result<(), CliError> {
     #[cfg(not(debug_assertions))]
     error_stack::Report::install_debug_hook::<std::panic::Location>(|_, _| {});
+
+    #[cfg(feature = "trace")]
+    {
+        use tracing_subscriber::{
+            fmt::format::DefaultFields, layer::SubscriberExt, util::SubscriberInitExt,
+        };
+
+        #[derive(Default)]
+        struct Config(DefaultFields);
+
+        impl tracing_tracy::Config for Config {
+            type Formatter = DefaultFields;
+
+            fn formatter(&self) -> &Self::Formatter {
+                &self.0
+            }
+
+            fn stack_depth(&self, _: &tracing::Metadata<'_>) -> u16 {
+                32
+            }
+
+            fn format_fields_in_zone_name(&self) -> bool {
+                false
+            }
+        }
+
+        tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::new(Config::default()))
+            .init();
+    };
 
     let args = Cpz::parse();
 
@@ -74,9 +109,13 @@ fn main() -> error_stack::Result<(), CliError> {
                     Ok(true) => {
                         let mut file = file.into_os_string();
                         file.push(MAIN_SEPARATOR_STR);
-                        report.attach_printable(format!(
-                            "Use the path {file:?} to copy into the directory."
-                        ))
+                        report
+                            .attach_printable(format!(
+                                "Use the path {file:?} to copy into the directory."
+                            ))
+                            .attach_printable(
+                                "Use --force to merge directories (overwriting existing files).",
+                            )
                     }
                     Ok(false) | Err(_) => report.attach_printable("Use --force to overwrite."),
                 }
@@ -120,7 +159,7 @@ fn copy(
     if from.len() > 1 || *is_into_directory {
         fs::create_dir_all(&to).map_err(|error| Error::Io {
             error,
-            context: format!("Failed to create directory {to:?}"),
+            context: format!("Failed to create directory {to:?}").into(),
         })?;
     }
 

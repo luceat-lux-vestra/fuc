@@ -1,4 +1,4 @@
-use std::io;
+use std::{borrow::Cow, io};
 
 pub use copy::{copy_file, CopyOp};
 #[cfg(target_os = "linux")]
@@ -11,14 +11,17 @@ mod copy;
 mod remove;
 
 trait IoErr<Out> {
-    fn map_io_err(self, f: impl FnOnce() -> String) -> Out;
+    fn map_io_err<I: Into<Cow<'static, str>>>(self, f: impl FnOnce() -> I) -> Out;
 }
 
 impl<T> IoErr<Result<T, Error>> for Result<T, io::Error> {
-    fn map_io_err(self, context: impl FnOnce() -> String) -> Result<T, Error> {
+    fn map_io_err<I: Into<Cow<'static, str>>>(
+        self,
+        context: impl FnOnce() -> I,
+    ) -> Result<T, Error> {
         self.map_err(|error| Error::Io {
             error,
-            context: context(),
+            context: context().into(),
         })
     }
 }
@@ -26,6 +29,7 @@ impl<T> IoErr<Result<T, Error>> for Result<T, io::Error> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
+        borrow::Cow,
         ffi::{CStr, CString, OsStr, OsString},
         io,
         os::unix::{
@@ -40,15 +44,20 @@ mod linux {
     use crate::{ops::IoErr, Error};
 
     impl<T> IoErr<Result<T, Error>> for Result<T, rustix::io::Errno> {
-        fn map_io_err(self, context: impl FnOnce() -> String) -> Result<T, Error> {
+        fn map_io_err<I: Into<Cow<'static, str>>>(
+            self,
+            context: impl FnOnce() -> I,
+        ) -> Result<T, Error> {
             self.map_err(io::Error::from).map_io_err(context)
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub fn path_buf_to_cstring(buf: PathBuf) -> Result<CString, Error> {
         CString::new(OsString::from(buf).into_vec()).map_err(|_| Error::BadPath)
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub fn concat_cstrs(prefix: &CString, name: &CStr) -> CString {
         let prefix = prefix.as_bytes();
         let name = name.to_bytes_with_nul();
@@ -60,12 +69,14 @@ mod linux {
         unsafe { CString::from_vec_with_nul_unchecked(path) }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub fn join_cstr_paths(path: &CString, name: &CStr) -> PathBuf {
         Path::new(OsStr::from_bytes(path.as_bytes()))
             .join(Path::new(OsStr::from_bytes(name.to_bytes())))
     }
 
     #[cold]
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(dir)))]
     pub fn get_file_type(
         dir: impl AsFd,
         file_name: &CStr,
